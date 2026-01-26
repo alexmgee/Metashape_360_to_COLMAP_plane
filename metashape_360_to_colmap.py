@@ -242,11 +242,60 @@ def crop_direction(
     return Image.fromarray(sampled, mode="RGB")
 
 
+def crop_direction_mask(
+    equirect_mask: Image.Image,
+    direction: str,
+    crop_size: int,
+    fov_deg: float = 90.0,
+    flip_vertical: bool = True,
+) -> Image.Image:
+    """Rectilinear 90° crop from equirectangular mask using cv2.remap with nearest-neighbor."""
+    yaw_deg = direction_yaw_deg(direction)
+    w_out = h_out = crop_size
+    fx = fy = (w_out / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
+    cx = cy = (w_out - 1) / 2.0
+    u, v = np.meshgrid(np.arange(w_out, dtype=np.float32), np.arange(h_out, dtype=np.float32))
+    x = (u - cx) / fx
+    y = (v - cy) / fy
+    z = np.ones_like(x)
+    dirs = np.stack([x, y, z], axis=-1)
+    dirs /= np.linalg.norm(dirs, axis=-1, keepdims=True)
+
+    yaw = np.deg2rad(yaw_deg)
+    cos_y = np.cos(yaw)
+    sin_y = np.sin(yaw)
+    R_y = np.array([[cos_y, 0, sin_y], [0, 1, 0], [-sin_y, 0, cos_y]], dtype=np.float32)
+    dirs = dirs @ R_y.T
+
+    lon = np.arctan2(dirs[..., 0], dirs[..., 2])
+    lat = np.arctan2(dirs[..., 1], np.sqrt(dirs[..., 0] ** 2 + dirs[..., 2] ** 2))
+
+    width, height = equirect_mask.size
+    map_x = (lon / (2 * np.pi) + 0.5) * float(width)
+    map_y = (0.5 - lat / np.pi) * float(height)
+    if flip_vertical:
+        map_y = (0.5 + lat / np.pi) * float(height)
+    map_y = np.clip(map_y, 0.0, float(height - 1))
+
+    # Convert to grayscale if needed
+    mask_np = np.array(equirect_mask.convert("L"))
+    sampled = cv2.remap(
+        mask_np,
+        map_x.astype(np.float32),
+        map_y.astype(np.float32),
+        interpolation=cv2.INTER_NEAREST,  # Preserve sharp mask edges
+        borderMode=cv2.BORDER_WRAP,
+    )
+
+    return Image.fromarray(sampled, mode="L")
+
+
 def convert_metashape_to_colmap(
     images_dir: Path,
     xml_path: Path,
     output_dir: Optional[Path] = None,
     ply_path: Optional[Path] = None,
+    masks_dir: Optional[Path] = None,
     crop_size: int = 512,
     fov_deg: float = 90.0,
     max_images: Optional[int] = None,
@@ -260,6 +309,18 @@ def convert_metashape_to_colmap(
     output_dir.mkdir(parents=True, exist_ok=True)
     images_output_dir = output_dir / "images"
     images_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Set up masks output if masks are provided
+    masks_output_dir = None
+    mask_filename_map: Dict[str, Path] = {}
+    if masks_dir is not None and masks_dir.is_dir():
+        masks_output_dir = output_dir / "masks"
+        masks_output_dir.mkdir(parents=True, exist_ok=True)
+        mask_extensions = [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".PNG", ".JPG", ".JPEG", ".TIF", ".TIFF"]
+        mask_files = []
+        for ext in mask_extensions:
+            mask_files.extend(masks_dir.glob(f"*{ext}"))
+        mask_filename_map = {mask_path.stem: mask_path for mask_path in mask_files}
 
     if verbose:
         print(f"Parsing Metashape XML: {xml_path}")
@@ -279,6 +340,8 @@ def convert_metashape_to_colmap(
 
     if verbose:
         print(f"Found {len(image_files)} equirectangular images in {images_dir}")
+        if masks_output_dir is not None:
+            print(f"Found {len(mask_filename_map)} masks in {masks_dir}")
 
     camera_id = 1  # single shared intrinsic entry
     fx = fy = (crop_size / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
@@ -351,6 +414,15 @@ def convert_metashape_to_colmap(
 
         base_name = Path(camera_label).stem
 
+        # Load corresponding mask if available
+        equirect_mask = None
+        if masks_output_dir is not None and base_name in mask_filename_map:
+            try:
+                equirect_mask = Image.open(mask_filename_map[base_name])
+            except Exception as exc:  # pragma: no cover - IO guard
+                if verbose:
+                    print(f"  Warning: failed to load mask for {camera_label} ({exc})")
+
         for direction in directions:
             cropped = crop_direction(
                 equirect_image,
@@ -362,6 +434,19 @@ def convert_metashape_to_colmap(
             output_image_name = f"{base_name}_{direction}.jpg"
             output_image_path = images_output_dir / output_image_name
             cropped.save(output_image_path, quality=95)
+
+            # Crop and save mask if available
+            if equirect_mask is not None:
+                cropped_mask = crop_direction_mask(
+                    equirect_mask,
+                    direction,
+                    crop_size,
+                    fov_deg=fov_deg,
+                    flip_vertical=flip_vertical,
+                )
+                output_mask_name = f"{base_name}_{direction}.png"
+                output_mask_path = masks_output_dir / output_mask_name
+                cropped_mask.save(output_mask_path)
 
             R_dir = get_direction_rotation_matrix(direction)
             R_c2w_dir = R_c2w @ R_dir  # align extrinsics with the rotated crop
@@ -486,6 +571,7 @@ def main() -> int:
     parser.add_argument("--xml", type=Path, required=True, help="Path to Metashape cameras.xml")
     parser.add_argument("--output", type=Path, required=True, help="Output directory (COLMAP layout)")
     parser.add_argument("--ply", type=Path, default=None, help="Optional PLY to export points3D.txt")
+    parser.add_argument("--masks", type=Path, default=None, help="Directory with mask files (matched by stem to images)")
     parser.add_argument("--crop-size", type=int, default=1920, help="Crop size for 90° views")
     parser.add_argument("--fov-deg", type=float, default=90.0, help="Horizontal FoV for rectilinear crops")
     parser.add_argument(
@@ -514,6 +600,9 @@ def main() -> int:
     if args.ply and not args.ply.is_file():
         print(f"Error: PLY file not found: {args.ply}")
         return 1
+    if args.masks and not args.masks.is_dir():
+        print(f"Error: Masks directory not found: {args.masks}")
+        return 1
 
     try:
         result = convert_metashape_to_colmap(
@@ -521,6 +610,7 @@ def main() -> int:
             xml_path=args.xml,
             output_dir=args.output,
             ply_path=args.ply,
+            masks_dir=args.masks,
             crop_size=args.crop_size,
             fov_deg=args.fov_deg,
             flip_vertical=args.flip_vertical,
