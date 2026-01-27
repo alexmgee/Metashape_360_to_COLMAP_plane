@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Project specific
+test/
+test_output/
+test_output_undistorted/
+.claude/
+nul
+
+# Keep these documentation files
+!README.md
+!CLAUDE.md
+!TROUBLESHOOTING.md
+!MetashapeProKnowledgeBase.md
+!PostshotKnowledgeBase.md

@@ -46,7 +46,10 @@ def find_param(calib_xml: ET.Element, param_name: str) -> float:
 
 
 def parse_metashape_xml(xml_path: Path) -> Dict[str, Any]:
-    """Parse Metashape XML and return sensors, components, and cameras."""
+    """Parse Metashape XML and return sensors, components, and cameras.
+
+    Supports mixed sensor types: spherical and frame (pinhole).
+    """
     xml_tree = ET.parse(xml_path)
     root = xml_tree.getroot()
     chunk = root[0]
@@ -55,24 +58,20 @@ def parse_metashape_xml(xml_path: Path) -> Dict[str, Any]:
     if sensors is None:
         raise ValueError("No sensors found in Metashape XML")
 
-    calibrated_sensors = [
+    # Get all sensors (spherical or frame with calibration)
+    all_sensors = [
         sensor for sensor in sensors.iter("sensor")
-        if sensor.get("type") == "spherical" or sensor.find("calibration")
+        if sensor.get("type") in ("spherical", "frame", "fisheye")
     ]
-    if not calibrated_sensors:
-        raise ValueError("No calibrated sensor found in Metashape XML")
+    if not all_sensors:
+        raise ValueError("No supported sensors found in Metashape XML")
 
-    sensor_types = [s.get("type") for s in calibrated_sensors]
-    if sensor_types.count(sensor_types[0]) != len(sensor_types):
-        raise ValueError("All sensors must share the same type")
+    sensor_dict: Dict[str, Dict[str, Any]] = {}
+    for sensor in all_sensors:
+        s: Dict[str, Any] = {}
+        sensor_type = sensor.get("type")
+        s["type"] = sensor_type  # Store sensor type
 
-    sensor_type = sensor_types[0]
-    if sensor_type != "spherical":
-        raise ValueError(f"Expected equirectangular (spherical) sensors, got {sensor_type}")
-
-    sensor_dict: Dict[str, Dict[str, float]] = {}
-    for sensor in calibrated_sensors:
-        s: Dict[str, float] = {}
         resolution = sensor.find("resolution")
         if resolution is None:
             raise ValueError("Resolution not found in Metashape XML")
@@ -81,15 +80,33 @@ def parse_metashape_xml(xml_path: Path) -> Dict[str, Any]:
         s["h"] = int(resolution.get("height"))
 
         calib = sensor.find("calibration")
-        if calib is None:
-            s["fl_x"] = s["w"] / 2.0
-            s["fl_y"] = s["h"]
-            s["cx"] = s["w"] / 2.0
-            s["cy"] = s["h"] / 2.0
-        else:
+
+        if sensor_type == "spherical":
+            # Spherical cameras may not have calibration
+            if calib is None:
+                s["fl_x"] = s["w"] / 2.0
+                s["fl_y"] = s["h"]
+                s["cx"] = s["w"] / 2.0
+                s["cy"] = s["h"] / 2.0
+            else:
+                f = calib.find("f")
+                if f is not None and f.text is not None:
+                    s["fl_x"] = s["fl_y"] = float(f.text)
+                else:
+                    s["fl_x"] = s["w"] / 2.0
+                    s["fl_y"] = s["h"]
+                s["cx"] = find_param(calib, "cx") + s["w"] / 2.0
+                s["cy"] = find_param(calib, "cy") + s["h"] / 2.0
+
+        elif sensor_type in ("frame", "fisheye"):
+            # Frame/pinhole cameras should have calibration
+            if calib is None:
+                raise ValueError(f"Frame sensor {sensor.get('id')} missing calibration")
+
             f = calib.find("f")
             if f is None or f.text is None:
-                raise ValueError("Focal length not found in Metashape XML")
+                raise ValueError(f"Focal length not found for sensor {sensor.get('id')}")
+
             s["fl_x"] = s["fl_y"] = float(f.text)
             s["cx"] = find_param(calib, "cx") + s["w"] / 2.0
             s["cy"] = find_param(calib, "cy") + s["h"] / 2.0
@@ -348,6 +365,55 @@ def crop_direction_mask(
     return Image.fromarray(sampled, mode="L")
 
 
+def get_colmap_camera_model(sensor_data: Dict[str, Any]) -> Tuple[str, list]:
+    """Determine COLMAP camera model and parameters from sensor data.
+
+    Returns:
+        Tuple of (model_name, params_list)
+    """
+    k1 = sensor_data.get("k1", 0.0)
+    k2 = sensor_data.get("k2", 0.0)
+    k3 = sensor_data.get("k3", 0.0)
+    p1 = sensor_data.get("p1", 0.0)
+    p2 = sensor_data.get("p2", 0.0)
+
+    fx = sensor_data["fl_x"]
+    fy = sensor_data["fl_y"]
+    cx = sensor_data["cx"]
+    cy = sensor_data["cy"]
+
+    # Check if we have significant distortion
+    has_radial = abs(k1) > 1e-8 or abs(k2) > 1e-8 or abs(k3) > 1e-8
+    has_tangential = abs(p1) > 1e-8 or abs(p2) > 1e-8
+
+    if not has_radial and not has_tangential:
+        # No distortion: PINHOLE model
+        return ("PINHOLE", [fx, fy, cx, cy])
+    elif has_tangential:
+        # Has tangential distortion: OPENCV model (k1, k2, p1, p2)
+        return ("OPENCV", [fx, fy, cx, cy, k1, k2, p1, p2])
+    else:
+        # Only radial distortion: RADIAL model (f, cx, cy, k1, k2)
+        # Note: COLMAP RADIAL uses single focal length
+        f_avg = (fx + fy) / 2.0
+        return ("RADIAL", [f_avg, cx, cy, k1, k2])
+
+
+def copy_pinhole_image(
+    src_image_path: str,
+    output_image_path: str,
+) -> Tuple[str, str]:
+    """Copy a pinhole image to the output directory.
+
+    Returns:
+        Tuple of (output_name, output_path)
+    """
+    import shutil
+    shutil.copy2(src_image_path, output_image_path)
+    output_name = Path(output_image_path).name
+    return (output_name, output_image_path)
+
+
 def convert_metashape_to_colmap(
     images_dir: Path,
     xml_path: Path,
@@ -362,8 +428,23 @@ def convert_metashape_to_colmap(
     num_workers: int = 4,
     skip_component_transform_for_ply: bool = True,
     skip_bottom: bool = False,
+    preserve_structure: bool = False,
 ) -> Dict[str, Any]:
-    """Convert Metashape equirectangular data to COLMAP format."""
+    """Convert Metashape mixed-sensor data to COLMAP format.
+
+    Supports mixed datasets with spherical (360°) and frame (pinhole) cameras.
+
+    Args:
+        images_dir: Root directory containing images (searched recursively)
+        xml_path: Path to Metashape cameras.xml export
+        masks_dir: Optional root directory containing masks (searched recursively, matched by filename stem)
+        preserve_structure: If True, preserves subdirectory structure and uses symlinks for frame images
+
+    Behavior:
+        - Spherical cameras: Cropped to 6 rectilinear views (cubemap)
+        - Frame cameras: Copied as-is with original calibration (or symlinked if preserve_structure=True)
+        - Masks: Processed appropriately for each sensor type (cropped for spherical, copied for frame)
+    """
     if output_dir is None:
         output_dir = xml_path.parent
 
@@ -374,14 +455,42 @@ def convert_metashape_to_colmap(
     # Set up masks output if masks are provided
     masks_output_dir = None
     mask_filename_map: Dict[str, Path] = {}
+
+    # Determine mask search directory
+    mask_search_dir = None
     if masks_dir is not None and masks_dir.is_dir():
+        # User specified a masks directory
+        mask_search_dir = masks_dir
+    else:
+        # Auto-detect: look for "masks" subdirectory next to images_dir
+        candidate_masks = images_dir / "masks"
+        if candidate_masks.is_dir():
+            mask_search_dir = candidate_masks
+        # Also check parent directory for sibling "masks" folder
+        elif (images_dir.parent / "masks").is_dir():
+            mask_search_dir = images_dir.parent / "masks"
+
+    if mask_search_dir is not None:
         masks_output_dir = output_dir / "masks"
         masks_output_dir.mkdir(parents=True, exist_ok=True)
+        # Find all directories named "masks" and search only within them
         mask_extensions = [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".PNG", ".JPG", ".JPEG", ".TIF", ".TIFF"]
         mask_files = []
-        for ext in mask_extensions:
-            mask_files.extend(masks_dir.glob(f"*{ext}"))
-        mask_filename_map = {mask_path.stem: mask_path for mask_path in mask_files}
+
+        # Find all "masks" subdirectories
+        mask_dirs = [d for d in mask_search_dir.rglob("*") if d.is_dir() and d.name.lower() == "masks"]
+
+        # If no "masks" subdirectories found, check if mask_search_dir itself is a masks directory
+        if not mask_dirs and mask_search_dir.name.lower() == "masks":
+            mask_dirs = [mask_search_dir]
+
+        for mask_dir in mask_dirs:
+            for ext in mask_extensions:
+                mask_files.extend(mask_dir.glob(f"*{ext}"))  # Non-recursive glob within each masks directory
+
+        # Build mask filename map: stem -> full path
+        for mask_path in mask_files:
+            mask_filename_map[mask_path.stem] = mask_path
 
     if verbose:
         print(f"Parsing Metashape XML: {xml_path}")
@@ -391,34 +500,75 @@ def convert_metashape_to_colmap(
     component_dict = xml_data["component_dict"]
     cameras_xml = xml_data["cameras"]
 
-    image_extensions = [".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp"]
+    # Recursively search for all images in the input directory tree
+    image_extensions = [".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp", ".JPG", ".JPEG", ".PNG"]
     image_files = []
     for ext in image_extensions:
-        image_files.extend(images_dir.glob(f"*{ext}"))
+        image_files.extend(images_dir.rglob(f"*{ext}"))  # rglob = recursive glob
 
-    image_filename_map = {img_path.stem: img_path for img_path in image_files}
-    image_filename_map.update({img_path.name: img_path for img_path in image_files})
+    # Build filename map: stem -> (full path, relative path from images_dir)
+    image_filename_map = {}
+    for img_path in image_files:
+        rel_path = img_path.relative_to(images_dir)
+        image_filename_map[img_path.stem] = (img_path, rel_path)
+        image_filename_map[img_path.name] = (img_path, rel_path)
 
     if verbose:
-        print(f"Found {len(image_files)} equirectangular images in {images_dir}")
-        if masks_output_dir is not None:
-            print(f"Found {len(mask_filename_map)} masks in {masks_dir}")
+        print(f"Recursively searched {images_dir}")
+        print(f"  Found {len(image_files)} images across all subdirectories")
+        if mask_search_dir is not None:
+            if masks_dir is not None:
+                print(f"  Using masks from: {mask_search_dir} (user-specified)")
+            else:
+                print(f"  Auto-detected masks at: {mask_search_dir}")
+            print(f"  Found {len(mask_filename_map)} mask files")
         print(f"Component dict size: {len(component_dict)}")
         if component_dict:
             for comp_id, comp_mat in component_dict.items():
                 print(f"  Component '{comp_id}': {comp_mat}")
 
-    camera_id = 1  # single shared intrinsic entry
-    fx = fy = (crop_size / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
-    cx = cy = crop_size / 2.0
-    cameras_colmap = {
-        camera_id: {
+        # Print sensor summary
+        sensor_types_count = {}
+        for sensor_id, sensor_data in sensor_dict.items():
+            sensor_type = sensor_data["type"]
+            sensor_types_count[sensor_type] = sensor_types_count.get(sensor_type, 0) + 1
+        print(f"\nSensors found:")
+        for sensor_type, count in sensor_types_count.items():
+            print(f"  {sensor_type}: {count} sensor(s)")
+
+    # Build COLMAP camera models for each sensor
+    cameras_colmap: Dict[int, Dict[str, Any]] = {}
+    sensor_to_camera_id: Dict[str, int] = {}
+    camera_id = 1
+
+    # Camera ID 1: Spherical crops (if any spherical sensors exist)
+    spherical_sensors = [s_id for s_id, s in sensor_dict.items() if s["type"] == "spherical"]
+    if spherical_sensors:
+        fx = fy = (crop_size / 2.0) / np.tan(np.deg2rad(fov_deg) / 2.0)
+        cx = cy = crop_size / 2.0
+        cameras_colmap[camera_id] = {
             "width": crop_size,
             "height": crop_size,
             "model": "PINHOLE",
             "params": [fx, fy, cx, cy],
         }
-    }
+        # All spherical sensors share the same cropped camera model
+        for s_id in spherical_sensors:
+            sensor_to_camera_id[s_id] = camera_id
+        camera_id += 1
+
+    # Camera IDs 2+: Frame/pinhole sensors (each gets its own camera model)
+    for sensor_id, sensor_data in sensor_dict.items():
+        if sensor_data["type"] in ("frame", "fisheye"):
+            model_name, params = get_colmap_camera_model(sensor_data)
+            cameras_colmap[camera_id] = {
+                "width": sensor_data["w"],
+                "height": sensor_data["h"],
+                "model": model_name,
+                "params": params,
+            }
+            sensor_to_camera_id[sensor_id] = camera_id
+            camera_id += 1
 
     images_colmap: Dict[int, Dict[str, Any]] = {}
     image_id = 1
@@ -473,7 +623,7 @@ def convert_metashape_to_colmap(
         elif verbose and processed_cameras == 0:
             print(f"First camera '{camera_label}' component_id: {component_id} (NOT found in component_dict)")
 
-        src_image_path = image_filename_map[camera_label]
+        src_image_path, src_rel_path = image_filename_map[camera_label]
         try:
             # Test if image can be loaded
             test_img = Image.open(src_image_path)
@@ -489,6 +639,14 @@ def convert_metashape_to_colmap(
 
         base_name = Path(camera_label).stem
 
+        # Determine output subdirectory based on preserve_structure flag
+        if preserve_structure:
+            # Preserve the relative directory structure from source
+            output_subdir = src_rel_path.parent
+        else:
+            # Flatten everything into images/ root
+            output_subdir = Path(".")
+
         # Debug output for first valid camera
         if verbose and processed_cameras == 0:
             print(f"First valid camera '{camera_label}':")
@@ -496,34 +654,101 @@ def convert_metashape_to_colmap(
             print(f"  R_c2w:\n{R_c2w}")
             print(f"  t_c2w: {t_c2w}")
 
-        # Load corresponding mask if available
-        equirect_mask = None
-        if masks_output_dir is not None and base_name in mask_filename_map:
+        sensor_data = sensor_dict[sensor_id]
+        sensor_type = sensor_data["type"]
+        colmap_camera_id = sensor_to_camera_id[sensor_id]
+
+        # Branch based on sensor type
+        if sensor_type == "spherical":
+            # SPHERICAL CAMERA: Crop to 6 rectilinear directions
+            # Create output subdirectory
+            output_dir_for_camera = images_output_dir / output_subdir
+            output_dir_for_camera.mkdir(parents=True, exist_ok=True)
+
+            equirect_mask = None
+            if masks_output_dir is not None and base_name in mask_filename_map:
+                try:
+                    equirect_mask = Image.open(mask_filename_map[base_name])
+                except Exception as exc:  # pragma: no cover - IO guard
+                    if verbose:
+                        print(f"  Warning: failed to load mask for {camera_label} ({exc})")
+
+            # Queue tasks for each direction
+            for direction in directions:
+                output_image_name = f"{base_name}_{direction}.jpg"
+                output_image_rel_path = output_subdir / output_image_name
+                output_image_path = str(images_output_dir / output_image_rel_path)
+                crop_tasks.append((str(src_image_path), direction, crop_size, output_image_path, fov_deg, flip_vertical))
+                # Store relative path for images.txt
+                camera_metadata.append((str(output_image_rel_path).replace("\\", "/"), direction, R_c2w, t_c2w, colmap_camera_id, "spherical"))
+
+                # Crop and save mask if available (done sequentially since it's optional)
+                if equirect_mask is not None:
+                    cropped_mask = crop_direction_mask(
+                        equirect_mask,
+                        direction,
+                        crop_size,
+                        fov_deg=fov_deg,
+                        flip_vertical=flip_vertical,
+                    )
+                    output_mask_name = f"{base_name}_{direction}.png"
+                    output_mask_rel_path = output_subdir / output_mask_name
+                    output_mask_path = masks_output_dir / output_mask_rel_path
+                    output_mask_path.parent.mkdir(parents=True, exist_ok=True)
+                    cropped_mask.save(output_mask_path)
+
+        elif sensor_type in ("frame", "fisheye"):
+            # PINHOLE CAMERA: Copy or symlink image as-is
+            # Create output subdirectory
+            output_dir_for_camera = images_output_dir / output_subdir
+            output_dir_for_camera.mkdir(parents=True, exist_ok=True)
+
+            output_image_name = f"{base_name}.jpg"
+            output_image_rel_path = output_subdir / output_image_name
+            output_image_path = images_output_dir / output_image_rel_path
+
+            # Copy or symlink the image
             try:
-                equirect_mask = Image.open(mask_filename_map[base_name])
-            except Exception as exc:  # pragma: no cover - IO guard
+                if preserve_structure:
+                    # Use symlink to avoid duplicating data
+                    import os
+                    if output_image_path.exists():
+                        output_image_path.unlink()
+                    # Create relative symlink
+                    os.symlink(src_image_path, output_image_path)
+                else:
+                    # Copy the image (original behavior)
+                    copy_pinhole_image(str(src_image_path), str(output_image_path))
+
+                # Store relative path for images.txt
+                camera_metadata.append((str(output_image_rel_path).replace("\\", "/"), None, R_c2w, t_c2w, colmap_camera_id, "frame"))
+            except Exception as exc:
                 if verbose:
-                    print(f"  Warning: failed to load mask for {camera_label} ({exc})")
+                    print(f"  Error processing {camera_label}: {exc}")
+                num_skipped += 1
+                continue
 
-        # Queue tasks for each direction
-        for direction in directions:
-            output_image_name = f"{base_name}_{direction}.jpg"
-            output_image_path = str(images_output_dir / output_image_name)
-            crop_tasks.append((str(src_image_path), direction, crop_size, output_image_path, fov_deg, flip_vertical))
-            camera_metadata.append((base_name, direction, R_c2w, t_c2w))
+            # Copy or symlink mask if available
+            if masks_output_dir is not None and base_name in mask_filename_map:
+                try:
+                    mask_src = mask_filename_map[base_name]
+                    output_mask_rel_path = output_subdir / f"{base_name}.png"
+                    mask_dst = masks_output_dir / output_mask_rel_path
+                    mask_dst.parent.mkdir(parents=True, exist_ok=True)
 
-            # Crop and save mask if available (done sequentially since it's optional)
-            if equirect_mask is not None:
-                cropped_mask = crop_direction_mask(
-                    equirect_mask,
-                    direction,
-                    crop_size,
-                    fov_deg=fov_deg,
-                    flip_vertical=flip_vertical,
-                )
-                output_mask_name = f"{base_name}_{direction}.png"
-                output_mask_path = masks_output_dir / output_mask_name
-                cropped_mask.save(output_mask_path)
+                    if preserve_structure:
+                        # Use symlink for masks too
+                        import os
+                        if mask_dst.exists():
+                            mask_dst.unlink()
+                        os.symlink(mask_src, mask_dst)
+                    else:
+                        # Copy mask (original behavior)
+                        import shutil
+                        shutil.copy2(mask_src, mask_dst)
+                except Exception as exc:
+                    if verbose:
+                        print(f"  Warning: failed to process mask for {camera_label} ({exc})")
 
         processed_cameras += 1
 
@@ -544,11 +769,14 @@ def convert_metashape_to_colmap(
                     continue
 
     # Build images_colmap from results
-    for idx, (base_name, direction, R_c2w, t_c2w) in enumerate(camera_metadata):
-        output_image_name = f"{base_name}_{direction}.jpg"
-        
-        R_dir = get_direction_rotation_matrix(direction)
-        R_c2w_dir = R_c2w @ R_dir  # align extrinsics with the rotated crop
+    for idx, (output_rel_path, direction, R_c2w, t_c2w, cam_id, sensor_type) in enumerate(camera_metadata):
+        if sensor_type == "spherical":
+            # Spherical crop: apply direction rotation
+            R_dir = get_direction_rotation_matrix(direction)
+            R_c2w_dir = R_c2w @ R_dir  # align extrinsics with the rotated crop
+        else:
+            # Frame/pinhole: use transform as-is
+            R_c2w_dir = R_c2w
 
         R_w2c = R_c2w_dir.T
         t_w2c = -R_w2c @ t_c2w
@@ -557,18 +785,19 @@ def convert_metashape_to_colmap(
         images_colmap[image_id] = {
             "quat": q,  # [x, y, z, w]
             "tvec": t_w2c,
-            "camera_id": camera_id,
-            "name": output_image_name,
+            "camera_id": cam_id,
+            "name": output_rel_path,  # Use stored relative path
         }
         image_id += 1
         processed_images += 1
 
     if verbose:
-        print(f"Processed {processed_images} cropped images")
+        print(f"\nProcessed {processed_images} images total")
+        print(f"  From {processed_cameras} source cameras")
         if max_images is not None:
-            print(f"  (Stopped after {processed_cameras} source images due to --max-images)")
+            print(f"  (Stopped early due to --max-images={max_images})")
         if num_skipped > 0:
-            print(f"Skipped {num_skipped} camera(s) with missing data")
+            print(f"  Skipped {num_skipped} camera(s) with missing data")
 
     cameras_txt = output_dir / "cameras.txt"
     with open(cameras_txt, "w", encoding="utf-8") as f:
@@ -678,7 +907,7 @@ def main() -> int:
     parser.add_argument("--xml", type=Path, required=True, help="Path to Metashape cameras.xml")
     parser.add_argument("--output", type=Path, required=True, help="Output directory (COLMAP layout)")
     parser.add_argument("--ply", type=Path, default=None, help="Optional PLY to export points3D.txt")
-    parser.add_argument("--masks", type=Path, default=None, help="Directory with mask files (matched by stem to images)")
+    parser.add_argument("--masks", type=Path, default=None, help="Optional masks directory (searches recursively, matched by filename stem). If not specified, auto-detects 'masks' subdirectory.")
     parser.add_argument("--crop-size", type=int, default=1920, help="Crop size for 90° views")
     parser.add_argument("--fov-deg", type=float, default=90.0, help="Horizontal FoV for rectilinear crops")
     parser.add_argument(
@@ -697,6 +926,7 @@ def main() -> int:
     parser.add_argument("--num-workers", type=int, default=4, help="Number of worker processes for parallel image cropping")
     parser.add_argument("--apply-component-transform-for-ply", action="store_true", default=False, help="Apply component transform for PLY (default: disabled, as PLY is usually pre-transformed in Metashape)")
     parser.add_argument("--skip-bottom", action="store_true", default=False, help="Skip bottom view (may contain self-reflections)")
+    parser.add_argument("--preserve-structure", action="store_true", default=False, help="Preserve source directory structure in output and use symlinks for frame images (avoids data duplication)")
     parser.add_argument("--quiet", action="store_true", help="Suppress progress output")
 
     args = parser.parse_args()
@@ -729,6 +959,7 @@ def main() -> int:
             skip_component_transform_for_ply=not args.apply_component_transform_for_ply,
             verbose=not args.quiet,
             skip_bottom=args.skip_bottom,
+            preserve_structure=args.preserve_structure,
         )
         if not args.quiet:
             print("\nConversion complete!")
