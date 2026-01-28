@@ -34,18 +34,22 @@ Running COLMAP reconstruction tools (feature extraction, matching, triangulation
 - After COLMAP triangulation: 3,935 points (covering only 59/339 images)
 - Training result: Bright blobs or immediate failure
 
-### Solution: Delete Corrupted Binary Files
+### Solution: Delete Problematic Binary Files
 
-If you accidentally ran COLMAP reconstruction on Metashape data:
+The correct workflow avoids creating `points3D.bin` and `images.bin` entirely. After running `COLMAP image_undistorter` (which creates binary files), delete these specific files:
 
 ```bash
 # Navigate to your sparse reconstruction directory
 cd test_output_undistorted/sparse/0/
 
-# Delete corrupted binary files
+# Delete problematic binary files
 rm points3D.bin
 rm images.bin
-rm database.db
+
+# These binary files can remain (they're safe):
+# - cameras.bin
+# - frames.bin
+# - rigs.bin
 
 # Keep these text files (they contain the correct Metashape data):
 # - cameras.txt

@@ -774,6 +774,15 @@ def convert_metashape_to_colmap(
                         print(f"  Error processing crop {idx}: {exc}")
                     continue
 
+    # Coordinate system flip: Metashape Y-up to COLMAP Y-down
+    # COLMAP uses: X=right, Y=down, Z=forward
+    # Metashape uses: X=right, Y=up, Z=backward
+    flip_yz = np.array([
+        [1,  0,  0],
+        [0, -1,  0],
+        [0,  0, -1]
+    ])
+
     # Build images_colmap from results
     for idx, (output_rel_path, direction, R_c2w, t_c2w, cam_id, sensor_type) in enumerate(camera_metadata):
         if sensor_type == "spherical":
@@ -784,8 +793,12 @@ def convert_metashape_to_colmap(
             # Frame/pinhole: use transform as-is
             R_c2w_dir = R_c2w
 
-        R_w2c = R_c2w_dir.T
-        t_w2c = -R_w2c @ t_c2w
+        # Apply coordinate system flip (Metashape Y-up to COLMAP Y-down)
+        R_c2w_flipped = flip_yz @ R_c2w_dir @ flip_yz.T
+        t_c2w_flipped = flip_yz @ t_c2w
+
+        R_w2c = R_c2w_flipped.T
+        t_w2c = -R_w2c @ t_c2w_flipped
         q = quaternion_from_matrix(R_w2c)
 
         images_colmap[image_id] = {
@@ -860,6 +873,17 @@ def convert_metashape_to_colmap(
                 print(f"    First 3 points after: {points3d[:3]}")
         elif skip_component_transform_for_ply and verbose:
             print(f"  Skipping component transform for PLY (--skip-component-transform-for-ply enabled)")
+
+        # Apply coordinate system flip (Metashape Y-up to COLMAP Y-down)
+        flip_yz = np.array([
+            [1,  0,  0],
+            [0, -1,  0],
+            [0,  0, -1]
+        ])
+        points3d = (flip_yz @ points3d.T).T
+        if verbose:
+            print(f"  Applied coordinate system flip (Y-up to Y-down)")
+            print(f"    First 3 points after flip: {points3d[:3]}")
 
         for idx, point in enumerate(points3d, start=1):
             x, y, z = point
