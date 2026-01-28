@@ -469,6 +469,12 @@ def convert_metashape_to_colmap(
         # Also check parent directory for sibling "masks" folder
         elif (images_dir.parent / "masks").is_dir():
             mask_search_dir = images_dir.parent / "masks"
+        else:
+            # Fallback: recursively search for any "masks" subdirectories within images_dir
+            mask_candidates = [d for d in images_dir.rglob("*") if d.is_dir() and d.name.lower() == "masks"]
+            if mask_candidates:
+                # Use images_dir as search root so rglob will find all masks subdirectories
+                mask_search_dir = images_dir
 
     if mask_search_dir is not None:
         masks_output_dir = output_dir / "masks"

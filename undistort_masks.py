@@ -127,11 +127,11 @@ def main():
 
     # Parse cameras from both original and undistorted
     cameras_src = parse_cameras_txt(args.input / "cameras.txt")
-    cameras_dst = parse_cameras_txt(args.output / "sparse" / "cameras.txt")
+    cameras_dst = parse_cameras_txt(args.output / "sparse" / "0" / "cameras.txt")
 
     # Parse images to get camera mapping
     image_to_camera_src = parse_images_txt(args.input / "images.txt")
-    image_to_camera_dst = parse_images_txt(args.output / "sparse" / "images.txt")
+    image_to_camera_dst = parse_images_txt(args.output / "sparse" / "0" / "images.txt")
 
     print(f"Found {len(cameras_src)} source cameras")
     print(f"Found {len(cameras_dst)} destination cameras")
